@@ -1,0 +1,8 @@
+# Generated training environments and Experiment 2 artifacts/checkpoints.
+/.cuda311/
+/experiment_2/
+/experiment_3/
+
+# Python runtime caches.
+__pycache__/
+*.py[cod]
