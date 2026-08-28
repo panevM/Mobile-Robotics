@@ -1,101 +1,83 @@
-"""Scratch-trained Experiment 3 for mobile dual-scale MiniGrid DQN policies."""
+"""Experiment 3.1 fine-tuning for the dual-scale MiniGrid DQN."""
 
 from __future__ import annotations
 
 import csv
-import json
 import math
 import shutil
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 import torch
 import torch.optim as optim
 
-from minigrid.core.constants import STATE_TO_IDX
-
-from utils.dqn_utils import hard_update_target, linear_epsilon, set_seed
+from utils.dqn_utils import hard_update_target, set_seed
 from utils.minigrid_dual_scale_dqn import (
     DualScaleMapDQN,
     DualScaleReplayBuffer,
     EXPLORATION_ACTIONS,
     dual_scale_dqn_train_step,
-    load_dual_scale_checkpoint,
     make_dual_scale_state,
     mask_q_values,
     save_dual_scale_checkpoint,
     select_masked_greedy_action,
 )
-from utils.minigrid_map_encoder import PersistentMapTensorEncoder
+from utils.minigrid_experiment3 import (
+    ACTION_NAMES,
+    DEFAULT_COVERAGE_THRESHOLDS,
+    Experiment3RewardConfig,
+    _encoder_from_config,
+    _save_curve_png,
+    _save_json,
+    _save_multi_curve_png,
+    _steps_to_thresholds,
+    compute_exploration_reward,
+    forward_cell_is_known_blocked,
+    known_traversable_cells,
+    reachable_frontier_distance,
+    select_epsilon_greedy_action_with_source,
+)
 from utils.minigrid_mapper import PersistentMiniGridMapper
 from utils.procedural_rooms_env import ENVIRONMENT_ID
 
 
-ACTION_NAMES = {
-    0: "left",
-    1: "right",
-    2: "forward",
-    3: "pickup",
-    4: "drop",
-    5: "toggle",
-    6: "done",
-}
-DEFAULT_COVERAGE_THRESHOLDS = (0.50, 0.75, 0.90)
-
-
 @dataclass(frozen=True)
-class Experiment3RewardConfig:
-    """Novelty-dominant reward with explicit anti-stagnation penalties."""
-
-    novelty_beta: float = 1.0
-    frontier_progress_beta: float = 0.5
-    stationary_penalty: float = -0.5
-    oscillation_penalty: float = -2
-    blocked_penalty: float = -2
-
-
-@dataclass(frozen=True)
-class DeadlockConfig:
-    """RL-level early termination for persistent unproductive behavior."""
+class Experiment31DeadlockConfig:
+    """Experiment 3 deadlocks plus a map-size-aware no-progress timeout."""
 
     oscillation_deadlock_threshold: int = 8
     stationary_deadlock_threshold: int = 8
     deadlock_penalty: float = -1.0
-    no_discovery_deadlock_multiplier: float = 1.0
+    no_progress_timeout_multiplier: float = 2.0
 
     def __post_init__(self):
         if self.oscillation_deadlock_threshold < 2:
             raise ValueError("oscillation_deadlock_threshold must be at least 2")
         if self.stationary_deadlock_threshold < 1:
             raise ValueError("stationary_deadlock_threshold must be positive")
-        if self.no_discovery_deadlock_multiplier <= 0:
-            raise ValueError("no_discovery_deadlock_multiplier must be positive")
+        if self.no_progress_timeout_multiplier <= 0:
+            raise ValueError("no_progress_timeout_multiplier must be positive")
 
-    def no_discovery_threshold(self, width, height):
-        """Return the map-size-aware consecutive no-discovery cutoff."""
+    def no_progress_timeout(self, width, height):
         return max(
             1,
-            int(math.ceil(self.no_discovery_deadlock_multiplier * (width + height))),
+            int(math.ceil(self.no_progress_timeout_multiplier * (width + height))),
         )
 
 
-class DeadlockDetector:
-    """Track alternating rotations and prolonged residence at one position.
+class ExplorationProgressDetector:
+    """Preserve Experiment 3 deadlocks and track discovery-or-BFS progress."""
 
-    The first unproductive reversal represents an alternating sequence of two
-    actions. Thus L,R,L,R,L,R,L,R reaches a threshold of eight on action eight.
-    """
-
-    def __init__(self, config, no_discovery_deadlock_threshold=None):
+    def __init__(self, config, no_progress_timeout=None):
         self.config = config
-        self.no_discovery_deadlock_threshold = no_discovery_deadlock_threshold
+        self.no_progress_timeout = no_progress_timeout
         self.oscillation_counter = 0
         self.stationary_counter = 0
-        self.steps_since_discovery = 0
+        self.steps_since_exploration_progress = 0
 
     def update(
         self,
@@ -112,7 +94,8 @@ class DeadlockDetector:
             and frontier_distance_after is not None
             and frontier_distance_after < frontier_distance_before
         )
-        productive = bool(position_changed or new_cells > 0 or frontier_progress)
+        exploration_progress = bool(new_cells > 0 or frontier_progress)
+        productive = bool(position_changed or exploration_progress)
         reversal = bool(
             action in (0, 1)
             and previous_action in (0, 1)
@@ -138,41 +121,40 @@ class DeadlockDetector:
         else:
             self.stationary_counter += 1
 
-        if new_cells > 0:
-            self.steps_since_discovery = 0
+        if exploration_progress:
+            self.steps_since_exploration_progress = 0
         else:
-            self.steps_since_discovery += 1
+            self.steps_since_exploration_progress += 1
 
         if self.oscillation_counter >= self.config.oscillation_deadlock_threshold:
             reason = "oscillation_deadlock"
         elif self.stationary_counter >= self.config.stationary_deadlock_threshold:
             reason = "stationary_deadlock"
         elif (
-            self.no_discovery_deadlock_threshold is not None
-            and self.steps_since_discovery >= self.no_discovery_deadlock_threshold
+            self.no_progress_timeout is not None
+            and self.steps_since_exploration_progress >= self.no_progress_timeout
         ):
-            reason = "no_discovery_deadlock"
+            reason = "no_progress_deadlock"
         else:
             reason = None
 
         return {
             "oscillation_counter": self.oscillation_counter,
             "stationary_counter": self.stationary_counter,
-            "steps_since_discovery": self.steps_since_discovery,
-            "no_discovery_deadlock_threshold": self.no_discovery_deadlock_threshold,
+            "frontier_progress_this_step": frontier_progress,
+            "exploration_progress_this_step": exploration_progress,
+            "steps_since_exploration_progress": self.steps_since_exploration_progress,
+            "no_progress_timeout": self.no_progress_timeout,
             "deadlock_triggered": reason is not None,
             "deadlock_type": reason,
-            "frontier_progress": frontier_progress,
         }
 
 
 def transition_is_done(terminated, truncated, deadlock_type):
-    """Combine environment completion with RL-level deadlock termination."""
     return bool(terminated or truncated or deadlock_type is not None)
 
 
 def episode_end_reason(terminated, truncated, deadlock_type):
-    """Return the most precise reason, prioritizing specific deadlocks."""
     if deadlock_type is not None:
         return deadlock_type
     if terminated:
@@ -182,166 +164,93 @@ def episode_end_reason(terminated, truncated, deadlock_type):
     return "in_progress"
 
 
-def is_known_traversable(cell):
-    """Return whether a mapper cell is traversable using known state only."""
-    if cell.object_name in {"empty", "floor", "goal", "lava"}:
-        return True
-    return cell.object_name == "door" and cell.state == STATE_TO_IDX["open"]
-
-
-def known_traversable_cells(mapper):
-    """Count currently mapped cells the mapper believes are traversable."""
-    return sum(is_known_traversable(cell) for cell in mapper.cells.values())
-
-
-def reachable_frontier_distance(mapper):
-    """Find the nearest frontier by BFS through known traversable cells.
-
-    Unknown cells are never entered. Unreachable frontier cells therefore do
-    not influence the returned distance.
-    """
-    start = tuple(int(value) for value in mapper.position)
-    frontiers = set(mapper.frontier_cells())
-    if not frontiers:
-        return None
-
-    traversable = {
-        position
-        for position, cell in mapper.cells.items()
-        if is_known_traversable(cell)
-    }
-    if start not in traversable:
-        return None
-
-    queue = deque([(start, 0)])
-    visited = {start}
-    while queue:
-        position, distance = queue.popleft()
-        if position in frontiers:
-            return distance
-
-        x, y = position
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            neighbour = (x + dx, y + dy)
-            if neighbour in traversable and neighbour not in visited:
-                visited.add(neighbour)
-                queue.append((neighbour, distance + 1))
-
-    return None
-
-
-def forward_cell_is_known_blocked(mapper):
-    """Check the pre-action cell ahead without consulting MiniGrid's true map."""
-    cell = mapper.cells.get(mapper.front_position())
-    return cell is not None and not is_known_traversable(cell)
-
-
-def compute_exploration_reward(
-    *,
-    mapping_update,
-    frontier_distance_before,
-    frontier_distance_after,
-    action,
-    position_before,
-    position_after,
-    previous_action,
-    forward_was_known_blocked,
-    config,
+def episode_linear_epsilon(
+    episode_index,
+    num_episodes,
+    epsilon_start=0.10,
+    epsilon_end=0.02,
 ):
-    """Compute Experiment 3 reward components from mapper-visible state."""
-    new_cells = int(mapping_update.new_cells)
-    novelty = float(config.novelty_beta * new_cells)
+    """Linearly interpolate epsilon by zero-based episode index."""
+    if num_episodes < 1:
+        raise ValueError("num_episodes must be positive")
+    if epsilon_start <= 0 or epsilon_end <= 0:
+        raise ValueError("epsilon must remain positive")
+    if epsilon_end > epsilon_start:
+        raise ValueError("epsilon_end cannot exceed epsilon_start")
+    if not 0 <= episode_index < num_episodes:
+        raise ValueError("episode_index must be within the fine-tuning run")
+    if num_episodes == 1 or episode_index == num_episodes - 1:
+        return float(epsilon_end)
+    if episode_index == 0:
+        return float(epsilon_start)
+    progress = episode_index / (num_episodes - 1)
+    return float(epsilon_start + progress * (epsilon_end - epsilon_start))
 
-    comparable_frontier_distance = (
-        frontier_distance_before is not None
-        and frontier_distance_after is not None
-    )
-    frontier_progress = 0.0
-    if new_cells == 0 and comparable_frontier_distance:
-        frontier_progress = float(
-            config.frontier_progress_beta
-            * (frontier_distance_before - frontier_distance_after)
-        )
 
-    blocked_forward = bool(
-        int(action) == 2
-        and tuple(position_before) == tuple(position_after)
-        and forward_was_known_blocked
-    )
-    stationary_action = tuple(position_before) == tuple(position_after)
-    stationary = float(config.stationary_penalty if stationary_action else 0.0)
-    oscillating = bool(
-        stationary_action
-        and (int(previous_action), int(action)) in {(0, 1), (1, 0)}
-    ) if previous_action is not None else False
-    oscillation = float(config.oscillation_penalty if oscillating else 0.0)
-    blocked = float(config.blocked_penalty if blocked_forward else 0.0)
-    distance_delta = None
-    if comparable_frontier_distance:
-        distance_delta = frontier_distance_before - frontier_distance_after
+def training_fraction(episode_index, num_episodes):
+    if num_episodes < 1:
+        raise ValueError("num_episodes must be positive")
+    return float(1.0 if num_episodes == 1 else episode_index / (num_episodes - 1))
 
+
+def _safe_ratio(numerator, denominator):
+    return float(numerator / denominator) if denominator else 0.0
+
+
+def calculate_action_source_metrics(counts):
+    """Retain Experiment 3 diagnostics and add both new-cell fractions."""
+    random_actions = int(counts.get("random_action_count", 0))
+    greedy_actions = int(counts.get("greedy_action_count", 0))
+    random_discoveries = int(counts.get("random_discovery_actions", 0))
+    greedy_discoveries = int(counts.get("greedy_discovery_actions", 0))
+    random_new_cells = int(counts.get("random_new_cells", 0))
+    greedy_new_cells = int(counts.get("greedy_new_cells", 0))
+    total_discoveries = random_discoveries + greedy_discoveries
+    total_new_cells = random_new_cells + greedy_new_cells
+    random_new_cell_fraction = _safe_ratio(random_new_cells, total_new_cells)
+    greedy_new_cell_fraction = _safe_ratio(greedy_new_cells, total_new_cells)
     return {
-        "total": novelty + frontier_progress + stationary + oscillation + blocked,
-        "novelty": novelty,
-        "frontier": frontier_progress,
-        "stationary": stationary,
-        "oscillation": oscillation,
-        "blocked": blocked,
-        "deadlock": 0.0,
-        "stationary_action": stationary_action,
-        "oscillating": oscillating,
-        "blocked_forward": blocked_forward,
-        "frontier_reduced": bool(new_cells == 0 and distance_delta is not None and distance_delta > 0),
-        "frontier_increased": bool(new_cells == 0 and distance_delta is not None and distance_delta < 0),
-        "no_reachable_frontier": frontier_distance_before is None,
+        "random_action_count": random_actions,
+        "greedy_action_count": greedy_actions,
+        "random_discovery_actions": random_discoveries,
+        "greedy_discovery_actions": greedy_discoveries,
+        "random_new_cells": random_new_cells,
+        "greedy_new_cells": greedy_new_cells,
+        "random_discovery_probability": _safe_ratio(random_discoveries, random_actions),
+        "greedy_discovery_probability": _safe_ratio(greedy_discoveries, greedy_actions),
+        "fraction_of_discovery_events_from_random": _safe_ratio(
+            random_discoveries, total_discoveries
+        ),
+        "fraction_of_new_cells_from_random": random_new_cell_fraction,
+        "fraction_new_cells_from_random": random_new_cell_fraction,
+        "fraction_new_cells_from_greedy": greedy_new_cell_fraction,
+        "random_position_change_probability": _safe_ratio(
+            counts.get("random_position_changes", 0), random_actions
+        ),
+        "greedy_position_change_probability": _safe_ratio(
+            counts.get("greedy_position_changes", 0), greedy_actions
+        ),
+        "random_forward_actions": int(counts.get("random_forward_actions", 0)),
+        "greedy_forward_actions": int(counts.get("greedy_forward_actions", 0)),
+        "random_forward_movements": int(counts.get("random_forward_movements", 0)),
+        "greedy_forward_movements": int(counts.get("greedy_forward_movements", 0)),
+        "random_stationary_actions": int(counts.get("random_stationary_actions", 0)),
+        "greedy_stationary_actions": int(counts.get("greedy_stationary_actions", 0)),
     }
-
-
-def select_epsilon_greedy_action_with_source(
-    policy_net,
-    state,
-    epsilon,
-    device,
-    allowed_actions=EXPLORATION_ACTIONS,
-    random_generator=None,
-):
-    """Select an action and identify the epsilon branch that produced it."""
-    allowed_actions = tuple(int(action) for action in allowed_actions)
-    if not allowed_actions:
-        raise ValueError("allowed_actions cannot be empty")
-
-    if random_generator is None:
-        random_generator = np.random.default_rng()
-    if random_generator.random() < epsilon:
-        action = allowed_actions[int(random_generator.integers(len(allowed_actions)))]
-        return action, "random"
-    return select_masked_greedy_action(
-        policy_net, state, device, allowed_actions=allowed_actions
-    ), "greedy"
-
-
-def _encoder_from_config(tensor_config):
-    encoder = PersistentMapTensorEncoder(**tensor_config)
-    encoder.reset()
-    return encoder
-
-
-def _steps_to_thresholds(coverage_history, thresholds):
-    result = {}
-    coverage = np.asarray(coverage_history, dtype=float)
-    for threshold in thresholds:
-        reached = np.flatnonzero(coverage >= threshold)
-        result[threshold] = float(reached[0]) if reached.size else np.nan
-    return result
 
 
 def summarize_evaluations(results, thresholds=DEFAULT_COVERAGE_THRESHOLDS):
-    """Summarize coverage and report threshold success with conditional time."""
     if not results:
         raise ValueError("results cannot be empty")
-
     end_reason_counts = Counter(result["episode_end_reason"] for result in results)
     episode_count = len(results)
+    random_actions = sum(r["random_action_count"] for r in results)
+    greedy_actions = sum(r["greedy_action_count"] for r in results)
+    random_new_cells = sum(r["random_new_cells"] for r in results)
+    greedy_new_cells = sum(r["greedy_new_cells"] for r in results)
+    random_discoveries = sum(r["random_discovery_actions"] for r in results)
+    greedy_discoveries = sum(r["greedy_discovery_actions"] for r in results)
+    total_new_cells = random_new_cells + greedy_new_cells
     summary = {
         "mean_final_coverage": float(np.mean([r["final_coverage"] for r in results])),
         "median_final_coverage": float(np.median([r["final_coverage"] for r in results])),
@@ -355,12 +264,15 @@ def summarize_evaluations(results, thresholds=DEFAULT_COVERAGE_THRESHOLDS):
         "mean_maximum_consecutive_stationary_steps": float(
             np.mean([r["maximum_consecutive_stationary_steps"] for r in results])
         ),
-        "random_action_count": int(sum(r["random_action_count"] for r in results)),
+        "random_action_count": int(random_actions),
+        "greedy_action_count": int(greedy_actions),
+        "random_discovery_probability": _safe_ratio(random_discoveries, random_actions),
+        "greedy_discovery_probability": _safe_ratio(greedy_discoveries, greedy_actions),
+        "fraction_new_cells_from_random": _safe_ratio(random_new_cells, total_new_cells),
+        "fraction_new_cells_from_greedy": _safe_ratio(greedy_new_cells, total_new_cells),
         "oscillation_deadlock_count": int(end_reason_counts["oscillation_deadlock"]),
         "stationary_deadlock_count": int(end_reason_counts["stationary_deadlock"]),
-        "no_discovery_deadlock_count": int(
-            end_reason_counts["no_discovery_deadlock"]
-        ),
+        "no_progress_deadlock_count": int(end_reason_counts["no_progress_deadlock"]),
         "time_limit_count": int(end_reason_counts["time_limit"]),
         "environment_terminated_count": int(end_reason_counts["environment_terminated"]),
         "fraction_oscillation_deadlock": float(
@@ -369,8 +281,8 @@ def summarize_evaluations(results, thresholds=DEFAULT_COVERAGE_THRESHOLDS):
         "fraction_stationary_deadlock": float(
             end_reason_counts["stationary_deadlock"] / episode_count
         ),
-        "fraction_no_discovery_deadlock": float(
-            end_reason_counts["no_discovery_deadlock"] / episode_count
+        "fraction_no_progress_deadlock": float(
+            end_reason_counts["no_progress_deadlock"] / episode_count
         ),
         "fraction_time_limit": float(end_reason_counts["time_limit"] / episode_count),
     }
@@ -387,130 +299,22 @@ def summarize_evaluations(results, thresholds=DEFAULT_COVERAGE_THRESHOLDS):
     return summary
 
 
-def _json_ready(value):
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
-
-
-def _save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(_json_ready(data), indent=2), encoding="utf-8"
+def _mean_padded_curve(results):
+    histories = [np.asarray(result["coverage_history"], dtype=float) for result in results]
+    max_length = max(len(history) for history in histories)
+    padded = np.stack(
+        [np.pad(history, (0, max_length - len(history)), mode="edge") for history in histories]
     )
-
-
-def _save_curve_png(path, series, title, y_label, color, percent=False):
-    """Draw a kernel-safe line chart with PIL instead of Matplotlib."""
-    width, height = 900, 420
-    left, top, right, bottom = 78, 44, 24, 58
-    image = Image.new("RGB", (width, height), (248, 246, 240))
-    draw = ImageDraw.Draw(image)
-    plot_right = width - right
-    plot_bottom = height - bottom
-    draw.line((left, top, left, plot_bottom), fill=(45, 45, 45), width=2)
-    draw.line((left, plot_bottom, plot_right, plot_bottom), fill=(45, 45, 45), width=2)
-
-    values = np.asarray(
-        [np.nan if value is None else value for value in series], dtype=float
-    )
-    finite = values[np.isfinite(values)]
-    y_min = 0.0 if percent else (float(finite.min()) if finite.size else 0.0)
-    y_max = 1.0 if percent else (float(finite.max()) if finite.size else 1.0)
-    if y_max <= y_min:
-        y_max = y_min + 1.0
-
-    for tick in range(6):
-        fraction = tick / 5
-        y = plot_bottom - fraction * (plot_bottom - top)
-        value = y_min + fraction * (y_max - y_min)
-        label = f"{100 * value:.0f}%" if percent else f"{value:.1f}"
-        draw.line((left, y, plot_right, y), fill=(215, 212, 205), width=1)
-        draw.text((8, y - 7), label, fill=(55, 55, 55))
-
-    points = []
-    denominator = max(1, len(values) - 1)
-    for index, value in enumerate(values):
-        if not np.isfinite(value):
-            if len(points) >= 2:
-                draw.line(points, fill=color, width=3)
-            points = []
-            continue
-        x = left + index / denominator * (plot_right - left)
-        y = plot_bottom - (value - y_min) / (y_max - y_min) * (plot_bottom - top)
-        points.append((x, y))
-    if len(points) >= 2:
-        draw.line(points, fill=color, width=3)
-
-    draw.text((left, 14), title, fill=(30, 30, 30))
-    draw.text((width // 2 - 30, height - 28), "Step", fill=(55, 55, 55))
-    draw.text((8, top - 24), y_label, fill=(55, 55, 55))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(path)
-
-
-def _save_multi_curve_png(path, named_series, title):
-    width, height = 960, 460
-    left, top, right, bottom = 78, 48, 30, 62
-    image = Image.new("RGB", (width, height), (248, 246, 240))
-    draw = ImageDraw.Draw(image)
-    plot_right = width - right
-    plot_bottom = height - bottom
-    colors = ((28, 126, 92), (202, 91, 42), (50, 91, 168), (135, 75, 145))
-    draw.line((left, top, left, plot_bottom), fill=(45, 45, 45), width=2)
-    draw.line((left, plot_bottom, plot_right, plot_bottom), fill=(45, 45, 45), width=2)
-    for tick in range(6):
-        fraction = tick / 5
-        y = plot_bottom - fraction * (plot_bottom - top)
-        draw.line((left, y, plot_right, y), fill=(215, 212, 205), width=1)
-        draw.text((12, y - 7), f"{100 * fraction:.0f}%", fill=(55, 55, 55))
-
-    longest = max(len(values) for values in named_series.values())
-    for series_index, (name, values) in enumerate(named_series.items()):
-        color = colors[series_index % len(colors)]
-        values = np.asarray(values, dtype=float)
-        points = []
-        denominator = max(1, len(values) - 1)
-        for index, value in enumerate(values):
-            x = left + index / denominator * (plot_right - left)
-            y = plot_bottom - np.clip(value, 0.0, 1.0) * (plot_bottom - top)
-            points.append((x, y))
-        if len(points) >= 2:
-            draw.line(points, fill=color, width=3)
-        legend_x = left + 160 * series_index
-        draw.line((legend_x, height - 28, legend_x + 24, height - 28), fill=color, width=4)
-        draw.text((legend_x + 30, height - 35), name, fill=(45, 45, 45))
-
-    draw.text((left, 16), title, fill=(30, 30, 30))
-    draw.text((width // 2 - 30, plot_bottom + 22), f"Step (0-{longest - 1})", fill=(55, 55, 55))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(path)
+    return np.mean(padded, axis=0)
 
 
 def save_comparison_artifacts(output_dir, named_results, title):
-    """Save matched-seed summaries and mean coverage curves for controllers."""
+    """Save matched-seed summaries and robust mean coverage curves."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    summaries = {
-        name: summarize_evaluations(results)
-        for name, results in named_results.items()
-    }
-    curves = {
-        name: np.mean(
-            np.stack([result["coverage_history"] for result in results]), axis=0
-        )
-        for name, results in named_results.items()
-    }
+    summaries = {name: summarize_evaluations(results) for name, results in named_results.items()}
+    curves = {name: _mean_padded_curve(results) for name, results in named_results.items()}
     _save_json(output_dir / "summary.json", summaries)
-
     with (output_dir / "mean_coverage_curves.csv").open(
         "w", newline="", encoding="utf-8"
     ) as stream:
@@ -519,8 +323,7 @@ def save_comparison_artifacts(output_dir, named_results, title):
         writer.writerow(["step", *names])
         for step in range(max(len(curve) for curve in curves.values())):
             writer.writerow(
-                [step]
-                + [curve[step] if step < len(curve) else "" for curve in curves.values()]
+                [step] + [curve[step] if step < len(curve) else "" for curve in curves.values()]
             )
     _save_multi_curve_png(output_dir / "mean_coverage_curves.png", curves, title)
     return summaries
@@ -532,7 +335,7 @@ def _save_diagnostic_artifacts(output_dir, result, frames, action_log, ascii_sna
         if result.get("episode_end_reason") in {
             "oscillation_deadlock",
             "stationary_deadlock",
-            "no_discovery_deadlock",
+            "no_progress_deadlock",
         }:
             frames.extend([frames[-1].copy(), frames[-1].copy()])
         frames[0].save(
@@ -547,12 +350,7 @@ def _save_diagnostic_artifacts(output_dir, result, frames, action_log, ascii_sna
     summary = {
         key: value
         for key, value in result.items()
-        if key
-        not in {
-            "coverage_history",
-            "traversable_coverage_history",
-            "frontier_distance_history",
-        }
+        if key not in {"coverage_history", "traversable_coverage_history", "frontier_distance_history"}
     }
     _save_json(output_dir / f"seed_{result['seed']}_summary.json", summary)
 
@@ -572,18 +370,19 @@ def _save_diagnostic_artifacts(output_dir, result, frames, action_log, ascii_sna
         "\n".join(ascii_text), encoding="utf-8"
     )
 
-    csv_path = output_dir / f"seed_{result['seed']}_curves.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+    with (output_dir / f"seed_{result['seed']}_curves.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
         writer = csv.writer(stream)
         writer.writerow(["step", "map_coverage", "traversable_coverage", "frontier_distance"])
-        for row in zip(
-            range(len(result["coverage_history"])),
-            result["coverage_history"],
-            result["traversable_coverage_history"],
-            result["frontier_distance_history"],
-        ):
-            writer.writerow(row)
-
+        writer.writerows(
+            zip(
+                range(len(result["coverage_history"])),
+                result["coverage_history"],
+                result["traversable_coverage_history"],
+                result["frontier_distance_history"],
+            )
+        )
     _save_curve_png(
         output_dir / f"seed_{result['seed']}_coverage.png",
         result["coverage_history"],
@@ -621,12 +420,11 @@ def run_evaluation_episode(
     ascii_interval=5,
     validation_checkpoint_episode=None,
     thresholds=DEFAULT_COVERAGE_THRESHOLDS,
-    deadlock_config=DeadlockConfig(),
+    deadlock_config=Experiment31DeadlockConfig(),
 ):
-    """Run one greedy or random episode and optionally save full diagnostics."""
+    """Run one greedy or random episode using Experiment 3.1 termination."""
     if not random_controller and policy_net is None:
         raise ValueError("policy_net is required for greedy evaluation")
-
     env_config = dict(environment_config)
     if artifact_dir is not None:
         env_config["render_mode"] = "rgb_array"
@@ -650,17 +448,16 @@ def run_evaluation_episode(
     frames = []
     ascii_snapshots = []
     previous_action = None
-    no_discovery_threshold = deadlock_config.no_discovery_threshold(
-        evaluation_env.unwrapped.width,
-        evaluation_env.unwrapped.height,
+    no_progress_timeout = deadlock_config.no_progress_timeout(
+        evaluation_env.unwrapped.width, evaluation_env.unwrapped.height
     )
-    deadlock_detector = DeadlockDetector(
-        deadlock_config,
-        no_discovery_deadlock_threshold=no_discovery_threshold,
+    deadlock_detector = ExplorationProgressDetector(
+        deadlock_config, no_progress_timeout=no_progress_timeout
     )
     deadlock_type = None
     consecutive_stationary = 0
     maximum_consecutive_stationary = 0
+    discovery_actions = 0
 
     if artifact_dir is not None:
         frames.append(Image.fromarray(evaluation_env.render()).convert("RGB"))
@@ -677,7 +474,6 @@ def run_evaluation_episode(
     terminated = truncated = False
     step = 0
     while not (terminated or truncated or deadlock_type is not None):
-        # Learned validation is explicitly greedy: no epsilon branch is called.
         action = (
             int(rng.choice(EXPLORATION_ACTIONS))
             if random_controller
@@ -686,32 +482,32 @@ def run_evaluation_episode(
         position_before = tuple(mapper.position)
         frontier_before = reachable_frontier_distance(mapper)
         forward_blocked = forward_cell_is_known_blocked(mapper)
-
         mapper.predict_action(action)
         observation, _, terminated, truncated, _ = evaluation_env.step(action)
         update = mapper.observe(observation)
         frontier_after = reachable_frontier_distance(mapper)
+        position_after = tuple(mapper.position)
+        position_changed = position_after != position_before
         reward = compute_exploration_reward(
             mapping_update=update,
             frontier_distance_before=frontier_before,
             frontier_distance_after=frontier_after,
             action=action,
             position_before=position_before,
-            position_after=tuple(mapper.position),
+            position_after=position_after,
             previous_action=previous_action,
             forward_was_known_blocked=forward_blocked,
             config=reward_config,
         )
         state = make_dual_scale_state(encoder.encode(mapper))
         step += 1
-
+        discovery_actions += int(update.new_cells > 0)
         coverage = len(mapper.cells) / total_cells
         traversable_coverage = known_traversable_cells(mapper) / total_traversable
         coverage_history.append(coverage)
         traversable_history.append(traversable_coverage)
         frontier_history.append(frontier_after)
         new_cell_counts.append(update.new_cells)
-        position_changed = tuple(mapper.position) != position_before
         deadlock_status = deadlock_detector.update(
             action=action,
             previous_action=previous_action,
@@ -725,18 +521,8 @@ def run_evaluation_episode(
             reward["deadlock"] = float(deadlock_config.deadlock_penalty)
             reward["total"] += reward["deadlock"]
         consecutive_stationary = 0 if position_changed else consecutive_stationary + 1
-        maximum_consecutive_stationary = max(
-            maximum_consecutive_stationary, consecutive_stationary
-        )
-        for key in (
-            "total",
-            "novelty",
-            "frontier",
-            "stationary",
-            "oscillation",
-            "blocked",
-            "deadlock",
-        ):
+        maximum_consecutive_stationary = max(maximum_consecutive_stationary, consecutive_stationary)
+        for key in ("total", "novelty", "frontier", "stationary", "oscillation", "blocked", "deadlock"):
             reward_totals[key] += reward[key]
         for key in (
             "stationary_action",
@@ -755,15 +541,16 @@ def run_evaluation_episode(
                     "step": step,
                     "action": ACTION_NAMES[action],
                     "action_id": action,
-                    "action_source": (
-                        "random_baseline" if random_controller else "greedy/evaluation"
-                    ),
+                    "action_source": "random_baseline" if random_controller else "greedy/evaluation",
                     "agent_position": list(map(int, mapper.position)),
                     "agent_direction": int(mapper.direction),
                     "position_changed": position_changed,
+                    "frontier_distance": frontier_after,
+                    "frontier_progress_this_step": deadlock_status["frontier_progress_this_step"],
                     "new_cells": int(update.new_cells),
-                    "frontier_distance_before": frontier_before,
-                    "frontier_distance_after": frontier_after,
+                    "exploration_progress_this_step": deadlock_status["exploration_progress_this_step"],
+                    "steps_since_exploration_progress": deadlock_status["steps_since_exploration_progress"],
+                    "no_progress_timeout": deadlock_status["no_progress_timeout"],
                     "coverage": coverage,
                     "novelty_reward": reward["novelty"],
                     "frontier_reward": reward["frontier"],
@@ -774,28 +561,12 @@ def run_evaluation_episode(
                     "total_reward": reward["total"],
                     "oscillation_counter": deadlock_status["oscillation_counter"],
                     "stationary_counter": deadlock_status["stationary_counter"],
-                    "steps_since_discovery": deadlock_status[
-                        "steps_since_discovery"
-                    ],
-                    "no_discovery_deadlock_threshold": deadlock_status[
-                        "no_discovery_deadlock_threshold"
-                    ],
                     "deadlock_triggered": deadlock_status["deadlock_triggered"],
                     "deadlock_type": deadlock_type,
-                    "event": (
-                        f"EPISODE TERMINATED: {deadlock_type}"
-                        if deadlock_type is not None
-                        else None
-                    ),
+                    "event": f"EPISODE TERMINATED: {deadlock_type}" if deadlock_type else None,
                 }
             )
-            if (
-                update.new_cells > 0
-                or step % ascii_interval == 0
-                or terminated
-                or truncated
-                or deadlock_type is not None
-            ):
+            if update.new_cells > 0 or step % ascii_interval == 0 or terminated or truncated or deadlock_type:
                 ascii_snapshots.append(
                     {
                         "step": step,
@@ -811,6 +582,13 @@ def run_evaluation_episode(
     end_reason = episode_end_reason(terminated, truncated, deadlock_type)
     new_cells = np.asarray(new_cell_counts, dtype=float)
     steps_to_coverage = _steps_to_thresholds(coverage_history, thresholds)
+    total_new_cells = int(np.sum(new_cells))
+    random_actions = step if random_controller else 0
+    greedy_actions = 0 if random_controller else step
+    random_new_cells = total_new_cells if random_controller else 0
+    greedy_new_cells = 0 if random_controller else total_new_cells
+    random_discoveries = discovery_actions if random_controller else 0
+    greedy_discoveries = 0 if random_controller else discovery_actions
     result = {
         "seed": int(seed),
         "validation_checkpoint_episode": validation_checkpoint_episode,
@@ -833,15 +611,23 @@ def run_evaluation_episode(
         "blocked_penalty": float(reward_totals["blocked"]),
         "deadlock_penalty": float(reward_totals["deadlock"]),
         "stationary_action_count": int(event_counts["stationary_action"]),
-        "stationary_action_ratio": float(event_counts["stationary_action"] / step),
+        "stationary_action_ratio": _safe_ratio(event_counts["stationary_action"], step),
         "oscillation_count": int(event_counts["oscillating"]),
-        "oscillation_ratio": float(event_counts["oscillating"] / step),
+        "oscillation_ratio": _safe_ratio(event_counts["oscillating"], step),
         "blocked_action_count": int(event_counts["blocked_forward"]),
-        "blocked_forward_ratio": float(event_counts["blocked_forward"] / step),
-        "position_change_ratio": float(1.0 - event_counts["stationary_action"] / step),
+        "blocked_forward_ratio": _safe_ratio(event_counts["blocked_forward"], step),
+        "position_change_ratio": _safe_ratio(step - event_counts["stationary_action"], step),
         "maximum_consecutive_stationary_steps": maximum_consecutive_stationary,
-        "random_action_count": step if random_controller else 0,
-        "greedy_action_count": 0 if random_controller else step,
+        "random_action_count": random_actions,
+        "greedy_action_count": greedy_actions,
+        "random_discovery_actions": random_discoveries,
+        "greedy_discovery_actions": greedy_discoveries,
+        "random_new_cells": random_new_cells,
+        "greedy_new_cells": greedy_new_cells,
+        "random_discovery_probability": _safe_ratio(random_discoveries, random_actions),
+        "greedy_discovery_probability": _safe_ratio(greedy_discoveries, greedy_actions),
+        "fraction_new_cells_from_random": _safe_ratio(random_new_cells, total_new_cells),
+        "fraction_new_cells_from_greedy": _safe_ratio(greedy_new_cells, total_new_cells),
         "frontier_distance_reduced_steps": int(event_counts["frontier_reduced"]),
         "frontier_distance_increased_steps": int(event_counts["frontier_increased"]),
         "no_reachable_frontier_steps": int(event_counts["no_reachable_frontier"]),
@@ -850,8 +636,8 @@ def run_evaluation_episode(
         "episode_end_reason": end_reason,
         "final_oscillation_counter": deadlock_detector.oscillation_counter,
         "final_stationary_counter": deadlock_detector.stationary_counter,
-        "final_steps_since_discovery": deadlock_detector.steps_since_discovery,
-        "no_discovery_deadlock_threshold": no_discovery_threshold,
+        "final_steps_since_exploration_progress": deadlock_detector.steps_since_exploration_progress,
+        "no_progress_timeout": no_progress_timeout,
     }
     if artifact_dir is not None:
         _save_diagnostic_artifacts(Path(artifact_dir), result, frames, action_log, ascii_snapshots)
@@ -869,72 +655,69 @@ def evaluate_exploration_controller(
     artifact_dir=None,
     validation_checkpoint_episode=None,
     thresholds=DEFAULT_COVERAGE_THRESHOLDS,
-    deadlock_config=DeadlockConfig(),
+    deadlock_config=Experiment31DeadlockConfig(),
 ):
-    """Evaluate multiple seeds with deterministic greedy learned actions."""
+    """Evaluate fixed seeds greedily unless an explicit random baseline is requested."""
     if policy_net is not None:
         policy_net.eval()
-    results = []
-    for seed in seeds:
-        seed_artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
-        results.append(
-            run_evaluation_episode(
-                seed,
-                environment_config,
-                tensor_config,
-                device,
-                reward_config,
-                deadlock_config=deadlock_config,
-                policy_net=policy_net,
-                random_controller=random_controller,
-                artifact_dir=seed_artifact_dir,
-                validation_checkpoint_episode=validation_checkpoint_episode,
-                thresholds=thresholds,
-            )
+    return [
+        run_evaluation_episode(
+            seed,
+            environment_config,
+            tensor_config,
+            device,
+            reward_config,
+            deadlock_config=deadlock_config,
+            policy_net=policy_net,
+            random_controller=random_controller,
+            artifact_dir=Path(artifact_dir) if artifact_dir is not None else None,
+            validation_checkpoint_episode=validation_checkpoint_episode,
+            thresholds=thresholds,
         )
-    return results
+        for seed in seeds
+    ]
 
 
-def _safe_ratio(numerator, denominator):
-    return float(numerator / denominator) if denominator else 0.0
+def initialize_experiment_3_1(pretrained_checkpoint, device, learning_rate, replay_capacity):
+    """Load only policy weights, then create fresh fine-tuning state."""
+    pretrained_checkpoint = Path(pretrained_checkpoint)
+    checkpoint = torch.load(pretrained_checkpoint, map_location=device, weights_only=False)
+    policy_net = DualScaleMapDQN(**checkpoint["architecture"]).to(device)
+    policy_net.load_state_dict(checkpoint["model_state_dict"])
+    target_net = DualScaleMapDQN(**checkpoint["architecture"]).to(device)
+    hard_update_target(policy_net, target_net)
+    target_net.eval()
+    policy_net.train()
+    optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
+    replay_buffer = DualScaleReplayBuffer(replay_capacity)
+    if len(replay_buffer) != 0:
+        raise RuntimeError("Experiment 3.1 replay buffer must start empty")
+    return policy_net, target_net, optimizer, replay_buffer, checkpoint
 
 
-def calculate_action_source_metrics(counts):
-    """Derive random-vs-greedy discovery and movement probabilities."""
-    random_actions = int(counts.get("random_action_count", 0))
-    greedy_actions = int(counts.get("greedy_action_count", 0))
-    random_discoveries = int(counts.get("random_discovery_actions", 0))
-    greedy_discoveries = int(counts.get("greedy_discovery_actions", 0))
-    random_new_cells = int(counts.get("random_new_cells", 0))
-    greedy_new_cells = int(counts.get("greedy_new_cells", 0))
-    total_discoveries = random_discoveries + greedy_discoveries
-    total_new_cells = random_new_cells + greedy_new_cells
-    return {
-        "random_action_count": random_actions,
-        "greedy_action_count": greedy_actions,
-        "random_discovery_actions": random_discoveries,
-        "greedy_discovery_actions": greedy_discoveries,
-        "random_new_cells": random_new_cells,
-        "greedy_new_cells": greedy_new_cells,
-        "random_discovery_probability": _safe_ratio(random_discoveries, random_actions),
-        "greedy_discovery_probability": _safe_ratio(greedy_discoveries, greedy_actions),
-        "fraction_of_discovery_events_from_random": _safe_ratio(
-            random_discoveries, total_discoveries
-        ),
-        "fraction_of_new_cells_from_random": _safe_ratio(random_new_cells, total_new_cells),
-        "random_position_change_probability": _safe_ratio(
-            counts.get("random_position_changes", 0), random_actions
-        ),
-        "greedy_position_change_probability": _safe_ratio(
-            counts.get("greedy_position_changes", 0), greedy_actions
-        ),
-        "random_forward_actions": int(counts.get("random_forward_actions", 0)),
-        "greedy_forward_actions": int(counts.get("greedy_forward_actions", 0)),
-        "random_forward_movements": int(counts.get("random_forward_movements", 0)),
-        "greedy_forward_movements": int(counts.get("greedy_forward_movements", 0)),
-        "random_stationary_actions": int(counts.get("random_stationary_actions", 0)),
-        "greedy_stationary_actions": int(counts.get("greedy_stationary_actions", 0)),
+def _validate_controlled_configuration(
+    source_checkpoint,
+    reward_config,
+    deadlock_config,
+    tensor_config,
+    environment_config,
+):
+    source_reward = source_checkpoint.get("reward_config", {})
+    if source_reward != asdict(reward_config):
+        raise ValueError("Experiment 3.1 reward configuration must exactly match its source checkpoint")
+    source_deadlock = source_checkpoint.get("deadlock_config", {})
+    unchanged_deadlocks = {
+        "oscillation_deadlock_threshold": deadlock_config.oscillation_deadlock_threshold,
+        "stationary_deadlock_threshold": deadlock_config.stationary_deadlock_threshold,
+        "deadlock_penalty": deadlock_config.deadlock_penalty,
     }
+    for key, expected in unchanged_deadlocks.items():
+        if source_deadlock.get(key) != expected:
+            raise ValueError(f"Experiment 3.1 must preserve source {key}")
+    if source_checkpoint.get("tensor_config") != dict(tensor_config):
+        raise ValueError("Experiment 3.1 tensor configuration must match its source checkpoint")
+    if source_checkpoint.get("training_environment_config") != dict(environment_config):
+        raise ValueError("Experiment 3.1 environment configuration must match its source checkpoint")
 
 
 def _checkpoint_metadata(
@@ -942,6 +725,9 @@ def _checkpoint_metadata(
     episode,
     total_steps,
     epsilon,
+    fraction,
+    source_checkpoint_path,
+    source_checkpoint,
     reward_config,
     deadlock_config,
     tensor_config,
@@ -952,13 +738,21 @@ def _checkpoint_metadata(
     replay_buffer_initial_size,
 ):
     return {
-        "experiment_stage": 3,
-        "initialization": "random",
-        "pretrained_checkpoint": None,
+        "experiment_stage": "3.1",
+        "initialization": "experiment_3_finetune",
+        "pretrained_checkpoint": str(Path(source_checkpoint_path).resolve()),
+        "source_experiment_stage": source_checkpoint.get("experiment_stage"),
+        "source_training_episode": source_checkpoint.get("training_episode"),
+        "source_total_steps": source_checkpoint.get("total_steps"),
         "replay_buffer_initial_size": int(replay_buffer_initial_size),
+        "optimizer_initialization": "fresh_adam",
+        "target_initialization": "hard_update_from_inherited_policy",
         "training_episode": int(episode),
         "total_steps": int(total_steps),
+        "fine_tuning_total_steps": int(total_steps),
         "epsilon": float(epsilon),
+        "training_fraction": float(fraction),
+        "epsilon_schedule": "linear_by_finetuning_episode",
         "reward_config": asdict(reward_config),
         "deadlock_config": asdict(deadlock_config),
         "tensor_config": dict(tensor_config),
@@ -969,22 +763,21 @@ def _checkpoint_metadata(
     }
 
 
-def run_experiment_3(
+def run_experiment_3_1(
     *,
+    pretrained_checkpoint,
     output_dir,
     environment_config,
     tensor_config,
     validation_seeds,
     diagnostic_validation_seeds,
     device,
-    reward_config=Experiment3RewardConfig(),
-    deadlock_config=DeadlockConfig(),
-    num_training_episodes=2_000,
+    reward_config,
+    deadlock_config=Experiment31DeadlockConfig(),
+    num_finetune_episodes=1_000,
     training_seed_start=0,
     training_seed_count=10_000,
-    training_random_seed=44,
-    conv_channels=(32, 64, 64),
-    fusion_hidden_size=256,
+    training_random_seed=45,
     learning_rate=1e-4,
     gamma=0.99,
     batch_size=64,
@@ -994,17 +787,13 @@ def run_experiment_3(
     gradient_clip=10.0,
     epsilon_start=0.10,
     epsilon_end=0.02,
-    epsilon_decay_steps=300_000,
     validation_frequency=100,
 ):
-    """Train a randomly initialized Experiment 3 policy from scratch."""
-    if len(diagnostic_validation_seeds) != 3:
-        raise ValueError("diagnostic_validation_seeds must contain exactly three seeds")
-    if epsilon_start <= 0 or epsilon_end <= 0:
-        raise ValueError("training epsilon must remain above zero")
-    if epsilon_end > epsilon_start:
-        raise ValueError("epsilon_end cannot exceed epsilon_start")
-
+    """Fine-tune Experiment 3 weights with fresh optimizer and replay state."""
+    if num_finetune_episodes < 1:
+        raise ValueError("num_finetune_episodes must be positive")
+    if training_seed_count < 1:
+        raise ValueError("training_seed_count must be positive")
     output_dir = Path(output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     artifact_root = output_dir / "validation_artifacts"
@@ -1015,29 +804,16 @@ def run_experiment_3(
 
     set_seed(training_random_seed)
     rng = np.random.default_rng(training_random_seed)
-    policy_net = DualScaleMapDQN(
-        action_dim=7,
-        conv_channels=conv_channels,
-        fusion_hidden_size=fusion_hidden_size,
-    ).to(device)
-    target_net = DualScaleMapDQN(
-        action_dim=7,
-        conv_channels=conv_channels,
-        fusion_hidden_size=fusion_hidden_size,
-    ).to(device)
-    hard_update_target(policy_net, target_net)
-    target_net.eval()
-    policy_net.train()
-    optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
-    replay_buffer = DualScaleReplayBuffer(replay_capacity)
+    policy_net, target_net, optimizer, replay_buffer, source_checkpoint = initialize_experiment_3_1(
+        pretrained_checkpoint, device, learning_rate, replay_capacity
+    )
+    _validate_controlled_configuration(
+        source_checkpoint, reward_config, deadlock_config, tensor_config, environment_config
+    )
     replay_buffer_initial_size = len(replay_buffer)
-    if replay_buffer_initial_size != 0:
-        raise RuntimeError("Experiment 3 replay buffer must start empty")
-
     training_metrics = []
     validation_history = []
     total_steps = 0
-    epsilon = float(epsilon_start)
     training_env = gym.make(ENVIRONMENT_ID, **environment_config)
     total_cells = training_env.unwrapped.width * training_env.unwrapped.height
     thresholds = DEFAULT_COVERAGE_THRESHOLDS
@@ -1051,19 +827,21 @@ def run_experiment_3(
         "gradient_clip": gradient_clip,
         "epsilon_start": epsilon_start,
         "epsilon_end": epsilon_end,
-        "epsilon_decay_steps": epsilon_decay_steps,
+        "epsilon_schedule": "linear_by_finetuning_episode",
+        "num_finetune_episodes": num_finetune_episodes,
         "validation_frequency": validation_frequency,
         "deadlock_config": asdict(deadlock_config),
         "allowed_actions": EXPLORATION_ACTIONS,
-        "training_seed_range": (
-            training_seed_start,
-            training_seed_start + training_seed_count - 1,
-        ),
+        "training_seed_range": (training_seed_start, training_seed_start + training_seed_count - 1),
     }
 
     try:
-        for episode_index in range(num_training_episodes):
+        for episode_index in range(num_finetune_episodes):
             episode_number = episode_index + 1
+            fraction = training_fraction(episode_index, num_finetune_episodes)
+            epsilon = episode_linear_epsilon(
+                episode_index, num_finetune_episodes, epsilon_start, epsilon_end
+            )
             episode_seed = training_seed_start + (episode_index % training_seed_count)
             observation, _ = training_env.reset(seed=episode_seed)
             mapper = PersistentMiniGridMapper()
@@ -1071,7 +849,6 @@ def run_experiment_3(
             encoder = _encoder_from_config(tensor_config)
             state = make_dual_scale_state(encoder.encode(mapper))
             total_traversable = training_env.unwrapped.total_traversable_cells
-
             rewards = Counter()
             events = Counter()
             source_counts = Counter()
@@ -1081,13 +858,11 @@ def run_experiment_3(
             coverage_history = [len(mapper.cells) / total_cells]
             episode_steps = 0
             previous_action = None
-            no_discovery_threshold = deadlock_config.no_discovery_threshold(
-                training_env.unwrapped.width,
-                training_env.unwrapped.height,
+            no_progress_timeout = deadlock_config.no_progress_timeout(
+                training_env.unwrapped.width, training_env.unwrapped.height
             )
-            deadlock_detector = DeadlockDetector(
-                deadlock_config,
-                no_discovery_deadlock_threshold=no_discovery_threshold,
+            deadlock_detector = ExplorationProgressDetector(
+                deadlock_config, no_progress_timeout=no_progress_timeout
             )
             deadlock_type = None
             consecutive_stationary = 0
@@ -1095,20 +870,12 @@ def run_experiment_3(
             terminated = truncated = False
 
             while not (terminated or truncated or deadlock_type is not None):
-                epsilon = linear_epsilon(
-                    total_steps, epsilon_start, epsilon_end, epsilon_decay_steps
-                )
                 action, action_source = select_epsilon_greedy_action_with_source(
-                    policy_net,
-                    state,
-                    epsilon,
-                    device,
-                    random_generator=rng,
+                    policy_net, state, epsilon, device, random_generator=rng
                 )
                 position_before = tuple(mapper.position)
                 frontier_before = reachable_frontier_distance(mapper)
                 forward_blocked = forward_cell_is_known_blocked(mapper)
-
                 mapper.predict_action(action)
                 observation, _, terminated, truncated, _ = training_env.step(action)
                 update = mapper.observe(observation)
@@ -1157,15 +924,7 @@ def run_experiment_3(
 
                 total_steps += 1
                 episode_steps += 1
-                for key in (
-                    "total",
-                    "novelty",
-                    "frontier",
-                    "stationary",
-                    "oscillation",
-                    "blocked",
-                    "deadlock",
-                ):
+                for key in ("total", "novelty", "frontier", "stationary", "oscillation", "blocked", "deadlock"):
                     rewards[key] += reward[key]
                 for key in (
                     "stationary_action",
@@ -1176,44 +935,35 @@ def run_experiment_3(
                     "no_reachable_frontier",
                 ):
                     events[key] += int(reward[key])
-
                 source_counts[f"{action_source}_action_count"] += 1
                 source_counts[f"{action_source}_discovery_actions"] += int(update.new_cells > 0)
                 source_counts[f"{action_source}_new_cells"] += int(update.new_cells)
                 source_counts[f"{action_source}_position_changes"] += int(position_changed)
                 source_counts[f"{action_source}_forward_actions"] += int(action == 2)
-                source_counts[f"{action_source}_forward_movements"] += int(
-                    action == 2 and position_changed
-                )
+                source_counts[f"{action_source}_forward_movements"] += int(action == 2 and position_changed)
                 source_counts[f"{action_source}_stationary_actions"] += int(not position_changed)
-
                 consecutive_stationary = 0 if position_changed else consecutive_stationary + 1
-                maximum_consecutive_stationary = max(
-                    maximum_consecutive_stationary, consecutive_stationary
-                )
+                maximum_consecutive_stationary = max(maximum_consecutive_stationary, consecutive_stationary)
                 new_cell_counts.append(update.new_cells)
                 scale_counts[int(2 ** next_state.global_scale_log2)] += 1
                 coverage_history.append(len(mapper.cells) / total_cells)
                 state = next_state
                 previous_action = action
-
                 if total_steps % target_update_frequency == 0:
                     hard_update_target(policy_net, target_net)
 
             new_cells = np.asarray(new_cell_counts, dtype=float)
-            local_tensor, global_tensor, scale_tensor = DualScaleReplayBuffer._batch_states(
-                [state], device
-            )
+            local_tensor, global_tensor, scale_tensor = DualScaleReplayBuffer._batch_states([state], device)
             with torch.no_grad():
-                predicted_q = mask_q_values(
-                    policy_net(local_tensor, global_tensor, scale_tensor)
-                )[:, list(EXPLORATION_ACTIONS)]
-
+                predicted_q = mask_q_values(policy_net(local_tensor, global_tensor, scale_tensor))[:, list(EXPLORATION_ACTIONS)]
             source_metrics = calculate_action_source_metrics(source_counts)
             end_reason = episode_end_reason(terminated, truncated, deadlock_type)
             training_metrics.append(
                 {
                     "episode": episode_number,
+                    "training_fraction": fraction,
+                    "epsilon": epsilon,
+                    "epsilon_schedule": "linear_by_finetuning_episode",
                     "total_reward": float(rewards["total"]),
                     "novelty_reward": float(rewards["novelty"]),
                     "frontier_reward": float(rewards["frontier"]),
@@ -1228,9 +978,7 @@ def run_experiment_3(
                     "blocked_forward_count": int(events["blocked_forward"]),
                     "blocked_forward_ratio": _safe_ratio(events["blocked_forward"], episode_steps),
                     "maximum_consecutive_stationary_steps": maximum_consecutive_stationary,
-                    "position_change_ratio": _safe_ratio(
-                        episode_steps - events["stationary_action"], episode_steps
-                    ),
+                    "position_change_ratio": _safe_ratio(episode_steps - events["stationary_action"], episode_steps),
                     "frontier_distance_reduced_steps": int(events["frontier_reduced"]),
                     "frontier_distance_increased_steps": int(events["frontier_increased"]),
                     "no_reachable_frontier_steps": int(events["no_reachable_frontier"]),
@@ -1242,28 +990,12 @@ def run_experiment_3(
                     "steps_to_coverage": _steps_to_thresholds(coverage_history, thresholds),
                     "episode_length": episode_steps,
                     "episode_end_reason": end_reason,
-                    "oscillation_deadlock_count": int(
-                        end_reason == "oscillation_deadlock"
-                    ),
-                    "stationary_deadlock_count": int(
-                        end_reason == "stationary_deadlock"
-                    ),
-                    "no_discovery_deadlock_count": int(
-                        end_reason == "no_discovery_deadlock"
-                    ),
-                    "deadlock_episode_fraction": float(
-                        end_reason
-                        in {
-                            "oscillation_deadlock",
-                            "stationary_deadlock",
-                            "no_discovery_deadlock",
-                        }
-                    ),
-                    "final_steps_since_discovery": (
-                        deadlock_detector.steps_since_discovery
-                    ),
-                    "no_discovery_deadlock_threshold": no_discovery_threshold,
-                    "epsilon": epsilon,
+                    "oscillation_deadlock_count": int(end_reason == "oscillation_deadlock"),
+                    "stationary_deadlock_count": int(end_reason == "stationary_deadlock"),
+                    "no_progress_deadlock_count": int(end_reason == "no_progress_deadlock"),
+                    "deadlock_episode_fraction": float(end_reason in {"oscillation_deadlock", "stationary_deadlock", "no_progress_deadlock"}),
+                    "final_steps_since_exploration_progress": deadlock_detector.steps_since_exploration_progress,
+                    "no_progress_timeout": no_progress_timeout,
                     "training_loss": float(np.mean(losses)) if losses else np.nan,
                     "mean_predicted_q": float(predicted_q.mean().item()),
                     "max_predicted_q": float(predicted_q.max().item()),
@@ -1276,17 +1008,16 @@ def run_experiment_3(
                 finite_losses = [m["training_loss"] for m in recent if np.isfinite(m["training_loss"])]
                 mean_loss = float(np.mean(finite_losses)) if finite_losses else np.nan
                 print(
-                    f"Episode {episode_number:4d}/{num_training_episodes} | "
+                    f"Episode {episode_number:4d}/{num_finetune_episodes} | "
+                    f"training={fraction:.1%} | epsilon={epsilon:.3f} | "
                     f"coverage={np.mean([m['final_coverage'] for m in recent]):.1%} | "
                     f"reward={np.mean([m['total_reward'] for m in recent]):.2f} | "
-                    f"novelty={np.mean([m['novelty_reward'] for m in recent]):.2f} | "
-                    f"frontier={np.mean([m['frontier_reward'] for m in recent]):+.2f} | "
-                    f"epsilon={epsilon:.3f} | loss={mean_loss:.4f} | "
-                    f"move={np.mean([m['position_change_ratio'] for m in recent]):.1%} | "
-                    f"osc={np.mean([m['oscillation_ratio'] for m in recent]):.1%} | "
+                    f"loss={mean_loss:.4f} | move={np.mean([m['position_change_ratio'] for m in recent]):.1%} | "
                     f"deadlock={np.mean([m['deadlock_episode_fraction'] for m in recent]):.1%} | "
                     f"Pdisc(greedy)={np.mean([m['greedy_discovery_probability'] for m in recent]):.1%} | "
-                    f"Pdisc(random)={np.mean([m['random_discovery_probability'] for m in recent]):.1%}"
+                    f"Pdisc(random)={np.mean([m['random_discovery_probability'] for m in recent]):.1%} | "
+                    f"new-cells(greedy)={np.mean([m['fraction_new_cells_from_greedy'] for m in recent]):.1%} | "
+                    f"new-cells(random)={np.mean([m['fraction_new_cells_from_random'] for m in recent]):.1%}"
                 )
 
             if episode_number % validation_frequency == 0:
@@ -1307,6 +1038,9 @@ def run_experiment_3(
                     episode=episode_number,
                     total_steps=total_steps,
                     epsilon=epsilon,
+                    fraction=fraction,
+                    source_checkpoint_path=pretrained_checkpoint,
+                    source_checkpoint=source_checkpoint,
                     reward_config=reward_config,
                     deadlock_config=deadlock_config,
                     tensor_config=tensor_config,
@@ -1317,17 +1051,10 @@ def run_experiment_3(
                     replay_buffer_initial_size=replay_buffer_initial_size,
                 )
                 checkpoint_path = checkpoint_dir / f"checkpoint_ep_{episode_number:04d}.pth"
-                save_dual_scale_checkpoint(
-                    checkpoint_path,
-                    policy_net,
-                    target_net=target_net,
-                    optimizer=optimizer,
-                    metadata=metadata,
-                )
+                save_dual_scale_checkpoint(checkpoint_path, policy_net, target_net=target_net, optimizer=optimizer, metadata=metadata)
                 shutil.copy2(checkpoint_path, output_dir / "latest_checkpoint.pth")
                 _save_json(metrics_dir / "training_metrics.json", training_metrics)
                 _save_json(metrics_dir / "validation_history.json", validation_history)
-
                 diagnostic_dir = artifact_root / f"episode_{episode_number:04d}"
                 evaluate_exploration_controller(
                     diagnostic_validation_seeds,
@@ -1344,15 +1071,12 @@ def run_experiment_3(
                 policy_net.train()
                 print(
                     f"Validation {episode_number}: coverage={validation_summary['mean_final_coverage']:.1%} | "
-                    f"median={validation_summary['median_final_coverage']:.1%} | "
-                    f"zero-info={validation_summary['zero_information_ratio']:.1%} | "
-                    f"movement={validation_summary['position_change_ratio']:.1%} | "
-                    f"stationary={validation_summary['stationary_action_ratio']:.1%} | "
-                    f"oscillation={validation_summary['oscillation_ratio']:.1%} | "
                     f"osc-deadlock={validation_summary['fraction_oscillation_deadlock']:.1%} | "
                     f"stationary-deadlock={validation_summary['fraction_stationary_deadlock']:.1%} | "
-                    f"no-discovery={validation_summary['fraction_no_discovery_deadlock']:.1%} | "
+                    f"no-progress={validation_summary['fraction_no_progress_deadlock']:.1%} | "
                     f"time-limit={validation_summary['fraction_time_limit']:.1%} | "
+                    f"new-cells(greedy)={validation_summary['fraction_new_cells_from_greedy']:.1%} | "
+                    f"new-cells(random)={validation_summary['fraction_new_cells_from_random']:.1%} | "
                     f"50%={validation_summary['fraction_reaching_50']:.1%} | "
                     f"75%={validation_summary['fraction_reaching_75']:.1%} | "
                     f"90%={validation_summary['fraction_reaching_90']:.1%}"
@@ -1360,10 +1084,17 @@ def run_experiment_3(
     finally:
         training_env.close()
 
+    final_fraction = training_fraction(num_finetune_episodes - 1, num_finetune_episodes)
+    final_epsilon = episode_linear_epsilon(
+        num_finetune_episodes - 1, num_finetune_episodes, epsilon_start, epsilon_end
+    )
     final_metadata = _checkpoint_metadata(
         episode=len(training_metrics),
         total_steps=total_steps,
-        epsilon=epsilon,
+        epsilon=final_epsilon,
+        fraction=final_fraction,
+        source_checkpoint_path=pretrained_checkpoint,
+        source_checkpoint=source_checkpoint,
         reward_config=reward_config,
         deadlock_config=deadlock_config,
         tensor_config=tensor_config,
@@ -1374,42 +1105,36 @@ def run_experiment_3(
         replay_buffer_initial_size=replay_buffer_initial_size,
     )
     final_path = output_dir / "final_model.pth"
-    save_dual_scale_checkpoint(
-        final_path,
-        policy_net,
-        target_net=target_net,
-        optimizer=optimizer,
-        metadata=final_metadata,
-    )
+    save_dual_scale_checkpoint(final_path, policy_net, target_net=target_net, optimizer=optimizer, metadata=final_metadata)
     shutil.copy2(final_path, output_dir / "latest_checkpoint.pth")
     _save_json(metrics_dir / "training_metrics.json", training_metrics)
     _save_json(metrics_dir / "validation_history.json", validation_history)
     return policy_net, final_metadata
 
 
-def load_experiment3_policy(path, device):
-    """Load an Experiment 3 checkpoint for greedy evaluation."""
-    return load_dual_scale_checkpoint(path, device)
+def load_experiment31_policy(path, device):
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    policy_net = DualScaleMapDQN(**checkpoint["architecture"]).to(device)
+    policy_net.load_state_dict(checkpoint["model_state_dict"])
+    policy_net.eval()
+    return policy_net, checkpoint
 
 
 __all__ = [
-    "ACTION_NAMES",
     "DEFAULT_COVERAGE_THRESHOLDS",
-    "DeadlockConfig",
-    "DeadlockDetector",
+    "Experiment31DeadlockConfig",
     "Experiment3RewardConfig",
+    "ExplorationProgressDetector",
     "calculate_action_source_metrics",
-    "compute_exploration_reward",
-    "evaluate_exploration_controller",
     "episode_end_reason",
-    "forward_cell_is_known_blocked",
-    "known_traversable_cells",
-    "load_experiment3_policy",
-    "reachable_frontier_distance",
+    "episode_linear_epsilon",
+    "evaluate_exploration_controller",
+    "initialize_experiment_3_1",
+    "load_experiment31_policy",
     "run_evaluation_episode",
-    "run_experiment_3",
+    "run_experiment_3_1",
     "save_comparison_artifacts",
-    "select_epsilon_greedy_action_with_source",
     "summarize_evaluations",
+    "training_fraction",
     "transition_is_done",
 ]
