@@ -21,9 +21,11 @@ from utils.minigrid_exploration_diagnostics import compose_exploration_frame
 from utils.minigrid_exploration_policy import ExplorationActionSelector
 from utils.minigrid_exploration_rewards import compute_exploration_reward
 from utils.minigrid_exploration_topology import (
+    frontier_target_was_resolved,
     forward_cell_is_known_blocked,
     known_traversable_cells,
     reachable_frontier_distance,
+    reachable_frontier_regions,
 )
 from utils.minigrid_map_encoder import PersistentMapTensorEncoder
 from utils.minigrid_mapper import PersistentMiniGridMapper
@@ -110,6 +112,9 @@ class ExplorationEpisodeRunner:
         source_counts = Counter()
         scale_counts = Counter([int(2 ** state.global_scale_log2)])
         new_cell_counts = []
+        frontier_resolution_rewards = []
+        known_cells_at_frontier_resolution = []
+        reachable_frontiers_at_resolution = []
         losses = []
         action_log = []
         ascii_snapshots = []
@@ -161,6 +166,9 @@ class ExplorationEpisodeRunner:
             )
             position_before = tuple(mapper.position)
             frontier_before = reachable_frontier_distance(mapper)
+            known_cells_before = len(mapper.cells)
+            frontier_regions_before = reachable_frontier_regions(mapper)
+            reachable_frontier_count_before = len(frontier_regions_before)
             forward_blocked = forward_cell_is_known_blocked(mapper)
             previous_coverage = coverage_history[-1]
             known_positions_before = set(mapper.cells)
@@ -170,6 +178,11 @@ class ExplorationEpisodeRunner:
             mapping_update = mapper.observe(observation)
             newly_discovered = set(mapper.cells) - known_positions_before
             frontier_after = reachable_frontier_distance(mapper)
+            resolved_frontier = frontier_target_was_resolved(
+                frontier_regions_before,
+                mapper.frontier_cells(),
+                mapping_update.new_cells,
+            )
             position_after = tuple(mapper.position)
             position_changed = position_after != position_before
             current_coverage = mapper_coverage(mapper, total_cells)
@@ -198,6 +211,9 @@ class ExplorationEpisodeRunner:
                 consecutive_reversals=consecutive_reversals,
                 forward_was_known_blocked=forward_blocked,
                 coverage_milestone_bonus=coverage_update.bonus,
+                known_cells_before=known_cells_before,
+                reachable_frontier_count_before=reachable_frontier_count_before,
+                resolved_frontier=resolved_frontier,
                 config=self.config.reward,
             )
             deadlock_status = deadlocks.update(
@@ -226,8 +242,9 @@ class ExplorationEpisodeRunner:
             new_cell_counts.append(int(mapping_update.new_cells))
             scale_counts[int(2 ** next_state.global_scale_log2)] += 1
             for key in (
-                "total", "novelty", "frontier", "coverage_milestone", "stationary",
-                "oscillation", "blocked", "deadlock",
+                "total", "novelty", "frontier", "frontier_resolution",
+                "coverage_milestone", "stationary", "oscillation", "blocked",
+                "deadlock",
             ):
                 reward_totals[key] += reward[key]
             for key in (
@@ -236,6 +253,13 @@ class ExplorationEpisodeRunner:
             ):
                 event_counts[key] += int(reward[key])
             event_counts["coverage_milestones_crossed"] += len(coverage_update.crossed_milestones)
+            event_counts["frontier_resolution"] += int(reward["frontier_resolved"])
+            if reward["frontier_resolved"]:
+                frontier_resolution_rewards.append(reward["frontier_resolution"])
+                known_cells_at_frontier_resolution.append(known_cells_before)
+                reachable_frontiers_at_resolution.append(
+                    reachable_frontier_count_before
+                )
             source_counts[f"{action_source}_action_count"] += 1
             source_counts[f"{action_source}_discovery_actions"] += int(mapping_update.new_cells > 0)
             source_counts[f"{action_source}_new_cells"] += int(mapping_update.new_cells)
@@ -253,6 +277,15 @@ class ExplorationEpisodeRunner:
                 ]
                 if coverage_success:
                     milestone_events.append("reached complete coverage, SUCCESS")
+                frontier_resolution_event = None
+                if reward["frontier_resolved"]:
+                    frontier_resolution_event = (
+                        f"step {step}: known_cells={known_cells_before}, "
+                        f"reachable_frontiers={reachable_frontier_count_before}, "
+                        "resolved_frontier=True, "
+                        "frontier_resolution_reward="
+                        f"{reward['frontier_resolution']:.2f}"
+                    )
                 end_reason = episode_end_reason(terminated, truncated, deadlock_type, coverage_success)
                 action_log.append(
                     {
@@ -275,6 +308,16 @@ class ExplorationEpisodeRunner:
                         "coverage_success": coverage_success,
                         "novelty_reward": reward["novelty"],
                         "frontier_reward": reward["frontier"],
+                        "frontier_progress_reward": reward["frontier_progress"],
+                        "frontier_resolution_reward": reward[
+                            "frontier_resolution"
+                        ],
+                        "frontier_resolved": reward["frontier_resolved"],
+                        "known_cells_before": known_cells_before,
+                        "reachable_frontiers_before": (
+                            reachable_frontier_count_before
+                        ),
+                        "frontier_resolution_event": frontier_resolution_event,
                         "stationary_penalty": reward["stationary"],
                         "oscillation_penalty": reward["oscillation"],
                         "consecutive_reversals": consecutive_reversals,
@@ -309,6 +352,7 @@ class ExplorationEpisodeRunner:
                 )
                 if (
                     mapping_update.new_cells > 0
+                    or reward["frontier_resolved"]
                     or coverage_update.crossed_milestones
                     or step % self.config.validation.ascii_interval == 0
                     or done
@@ -347,6 +391,33 @@ class ExplorationEpisodeRunner:
             "total_reward": float(reward_totals["total"]),
             "novelty_reward": float(reward_totals["novelty"]),
             "frontier_reward": float(reward_totals["frontier"]),
+            "frontier_progress_reward": float(reward_totals["frontier"]),
+            "frontier_resolution_count": int(
+                event_counts["frontier_resolution"]
+            ),
+            "total_frontier_resolution_reward": float(
+                reward_totals["frontier_resolution"]
+            ),
+            "mean_frontier_resolution_reward": (
+                float(np.mean(frontier_resolution_rewards))
+                if frontier_resolution_rewards
+                else 0.0
+            ),
+            "maximum_frontier_resolution_reward": (
+                float(np.max(frontier_resolution_rewards))
+                if frontier_resolution_rewards
+                else 0.0
+            ),
+            "mean_known_cells_at_frontier_resolution": (
+                float(np.mean(known_cells_at_frontier_resolution))
+                if known_cells_at_frontier_resolution
+                else np.nan
+            ),
+            "mean_reachable_frontiers_at_resolution": (
+                float(np.mean(reachable_frontiers_at_resolution))
+                if reachable_frontiers_at_resolution
+                else np.nan
+            ),
             "coverage_milestone_reward": float(reward_totals["coverage_milestone"]),
             "stationary_penalty": float(reward_totals["stationary"]),
             "oscillation_penalty": float(reward_totals["oscillation"]),

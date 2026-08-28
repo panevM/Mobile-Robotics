@@ -67,6 +67,25 @@ def steps_to_thresholds(coverage_history, thresholds):
     return result
 
 
+def safe_correlation(x_values, y_values):
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+    finite = np.isfinite(x_values) & np.isfinite(y_values)
+    if np.count_nonzero(finite) < 2:
+        return np.nan
+    x_values = x_values[finite]
+    y_values = y_values[finite]
+    if np.std(x_values) == 0.0 or np.std(y_values) == 0.0:
+        return np.nan
+    return float(np.corrcoef(x_values, y_values)[0, 1])
+
+
+def finite_mean_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if finite.size else np.nan
+
+
 def summarize_evaluations(results, thresholds=(0.50, 0.75, 0.90, 0.95, 1.00)):
     if not results:
         raise ValueError("results cannot be empty")
@@ -96,6 +115,30 @@ def summarize_evaluations(results, thresholds=(0.50, 0.75, 0.90, 0.95, 1.00)):
         "mean_maximum_consecutive_stationary_steps": float(
             np.mean([m["maximum_consecutive_stationary_steps"] for m in metrics])
         ),
+        "mean_frontier_resolution_count": float(
+            np.mean([m.get("frontier_resolution_count", 0) for m in metrics])
+        ),
+        "mean_total_frontier_resolution_reward": float(
+            np.mean(
+                [m.get("total_frontier_resolution_reward", 0.0) for m in metrics]
+            )
+        ),
+        "mean_frontier_resolution_reward": float(
+            np.mean(
+                [m.get("mean_frontier_resolution_reward", 0.0) for m in metrics]
+            )
+        ),
+        "maximum_frontier_resolution_reward": float(
+            np.max(
+                [m.get("maximum_frontier_resolution_reward", 0.0) for m in metrics]
+            )
+        ),
+        "mean_known_cells_at_frontier_resolution": finite_mean_or_nan(
+            [m.get("mean_known_cells_at_frontier_resolution", np.nan) for m in metrics]
+        ),
+        "mean_reachable_frontiers_at_resolution": finite_mean_or_nan(
+            [m.get("mean_reachable_frontiers_at_resolution", np.nan) for m in metrics]
+        ),
         **action_source_metrics(source_counts),
         "coverage_success_count": int(end_reasons["coverage_success"]),
         "oscillation_deadlock_count": int(end_reasons["oscillation_deadlock"]),
@@ -109,6 +152,15 @@ def summarize_evaluations(results, thresholds=(0.50, 0.75, 0.90, 0.95, 1.00)):
         "fraction_no_progress_deadlock": float(end_reasons["no_progress_deadlock"] / count),
         "fraction_time_limit": float(end_reasons["time_limit"] / count),
     }
+    final_coverages = [m["final_coverage"] for m in metrics]
+    summary["frontier_resolution_count_coverage_correlation"] = safe_correlation(
+        [m.get("frontier_resolution_count", 0) for m in metrics],
+        final_coverages,
+    )
+    summary["frontier_resolution_reward_coverage_correlation"] = safe_correlation(
+        [m.get("total_frontier_resolution_reward", 0.0) for m in metrics],
+        final_coverages,
+    )
     for threshold in thresholds:
         label = int(round(100 * threshold))
         values = np.asarray([m["steps_to_coverage"][float(threshold)] for m in metrics], dtype=float)

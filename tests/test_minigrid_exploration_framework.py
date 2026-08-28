@@ -11,7 +11,16 @@ from utils.minigrid_experiment_config import (
 from utils.minigrid_exploration_episode import transition_is_done
 from utils.minigrid_exploration_policy import episode_linear_epsilon
 from utils.minigrid_exploration_rewards import ExplorationRewardConfig, compute_exploration_reward
+from utils.minigrid_exploration_rewards import (
+    compute_adaptive_frontier_resolution_reward,
+)
+from utils.minigrid_exploration_topology import (
+    frontier_target_was_resolved,
+    reachable_frontier_regions,
+)
 from utils.minigrid_exploration_trainer import MiniGridExplorationTrainer
+from utils.minigrid_mapper import MapCell
+from minigrid.core.constants import OBJECT_TO_IDX
 
 
 def test_milestones_are_one_time_multi_crossing_and_episode_local():
@@ -159,3 +168,105 @@ def test_best_validation_prefers_large_then_coverage_tiebreaks():
     assert not MiniGridExplorationTrainer._is_better_validation(
         worse_deadlocks, large, 1e-3
     )
+
+
+def test_adaptive_frontier_reward_uses_log_growth_inverse_count_and_cap():
+    config = ExplorationRewardConfig(
+        adaptive_frontier_resolution_enabled=True,
+        frontier_base_reward=0.5,
+        frontier_map_scale=2.0,
+        frontier_known_cell_scale=25.0,
+        frontier_count_exponent=0.75,
+        frontier_reward_cap=5.0,
+    )
+    small_map = compute_adaptive_frontier_resolution_reward(
+        known_cells_before=25,
+        reachable_frontier_count_before=4,
+        resolved_frontier=True,
+        config=config,
+    )
+    large_map = compute_adaptive_frontier_resolution_reward(
+        known_cells_before=250,
+        reachable_frontier_count_before=4,
+        resolved_frontier=True,
+        config=config,
+    )
+    few_frontiers = compute_adaptive_frontier_resolution_reward(
+        known_cells_before=250,
+        reachable_frontier_count_before=1,
+        resolved_frontier=True,
+        config=config,
+    )
+    capped = compute_adaptive_frontier_resolution_reward(
+        known_cells_before=1_000_000,
+        reachable_frontier_count_before=1,
+        resolved_frontier=True,
+        config=config,
+    )
+    assert small_map < large_map < few_frontiers
+    assert capped == config.frontier_reward_cap
+    assert compute_adaptive_frontier_resolution_reward(
+        known_cells_before=250,
+        reachable_frontier_count_before=0,
+        resolved_frontier=True,
+        config=config,
+    ) == 0.0
+    assert compute_adaptive_frontier_resolution_reward(
+        known_cells_before=250,
+        reachable_frontier_count_before=1,
+        resolved_frontier=False,
+        config=config,
+    ) == 0.0
+
+
+def test_reachable_frontier_regions_and_one_time_resolution_detection():
+    class FakeMapper:
+        position = (0, 0)
+
+        def __init__(self):
+            empty = MapCell(OBJECT_TO_IDX["empty"], 0, 0)
+            self.cells = {
+                (0, 0): empty,
+                (1, 0): empty,
+                (2, 0): empty,
+                (0, 1): empty,
+                (0, 2): empty,
+            }
+            self.frontiers = {(1, 0), (2, 0), (0, 2)}
+
+        def frontier_cells(self):
+            return set(self.frontiers)
+
+    regions = reachable_frontier_regions(FakeMapper())
+    assert len(regions) == 2
+    assert not frontier_target_was_resolved(
+        regions, {(1, 0), (0, 2)}, new_cells=2
+    )
+    assert frontier_target_was_resolved(regions, {(0, 2)}, new_cells=2)
+    assert not frontier_target_was_resolved(regions, {(0, 2)}, new_cells=0)
+
+
+def test_frontier_resolution_is_a_separate_reward_component():
+    config = ExplorationRewardConfig(
+        adaptive_frontier_resolution_enabled=True,
+        novelty_beta=2.0,
+    )
+    reward = compute_exploration_reward(
+        new_cells=3,
+        frontier_distance_before=2,
+        frontier_distance_after=3,
+        action=2,
+        position_before=(0, 0),
+        position_after=(1, 0),
+        previous_action=2,
+        forward_was_known_blocked=False,
+        known_cells_before=100,
+        reachable_frontier_count_before=2,
+        resolved_frontier=True,
+        config=config,
+    )
+    assert reward["novelty"] == 6.0
+    assert reward["frontier"] == 0.0
+    assert reward["frontier_resolution"] > 0.0
+    assert reward["frontier_resolved"]
+    assert reward["total"] == reward["novelty"] + reward["frontier_resolution"]

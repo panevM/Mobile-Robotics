@@ -22,7 +22,14 @@ from utils.minigrid_exploration_episode import ExplorationEpisodeRunner
 from utils.minigrid_exploration_evaluation import MiniGridExplorationEvaluator
 from utils.minigrid_exploration_metrics import EpisodeResult, summarize_evaluations
 from utils.minigrid_exploration_policy import ExplorationActionSelector, episode_linear_epsilon
-from utils.minigrid_exploration_rewards import ExplorationRewardConfig
+from utils.minigrid_exploration_rewards import (
+    ExplorationRewardConfig,
+    compute_adaptive_frontier_resolution_reward,
+)
+from utils.minigrid_exploration_topology import (
+    frontier_target_was_resolved,
+    reachable_frontier_regions,
+)
 from utils.minigrid_exploration_trainer import MiniGridExplorationTrainer
 
 
@@ -46,7 +53,10 @@ __all__ = [
     "TensorConfig",
     "TrainingConfig",
     "ValidationConfig",
+    "compute_adaptive_frontier_resolution_reward",
     "episode_linear_epsilon",
+    "frontier_target_was_resolved",
+    "reachable_frontier_regions",
     "save_comparison_artifacts",
     "save_diagnostic_episode",
     "summarize_evaluations",

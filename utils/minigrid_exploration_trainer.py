@@ -241,6 +241,9 @@ class MiniGridExplorationTrainer:
             "pretrained_checkpoint": str(self.source_checkpoint_path.resolve()),
             "source_experiment_stage": self.source_checkpoint.get("experiment_stage"),
             "source_training_episode": self.source_checkpoint.get("training_episode"),
+            "parent_experiment": self.source_checkpoint.get("experiment_name"),
+            "initialization_checkpoint": self.source_checkpoint_path.name,
+            "new_experiment_identity": not self.is_continuation,
             "replay_buffer_initial_size": 0,
             "replay_buffer_restored": False,
             "optimizer_initialization": (
@@ -359,6 +362,8 @@ class MiniGridExplorationTrainer:
             f"osc={summary['fraction_oscillation_deadlock']:.1%} | "
             f"stationary={summary['fraction_stationary_deadlock']:.1%} | "
             f"no-progress={summary['fraction_no_progress_deadlock']:.1%} | "
+            f"frontier-res={summary['mean_frontier_resolution_count']:.2f} | "
+            f"frontier-res-reward={summary['mean_total_frontier_resolution_reward']:.2f} | "
             f"50%={summary['fraction_reaching_50']:.1%} | "
             f"75%={summary['fraction_reaching_75']:.1%} | "
             f"90%={summary['fraction_reaching_90']:.1%} | "
@@ -486,6 +491,8 @@ class MiniGridExplorationTrainer:
                     f"epsilon={epsilon:.3f} | coverage={np.mean([m['final_coverage'] for m in recent]):.1%} | "
                     f"success={np.mean([m['coverage_success'] for m in recent]):.1%} | "
                     f"milestones={np.mean([m['coverage_milestone_reward'] for m in recent]):.2f} | "
+                    f"frontier-res={np.mean([m['frontier_resolution_count'] for m in recent]):.2f} | "
+                    f"frontier-res-reward={np.mean([m['total_frontier_resolution_reward'] for m in recent]):.2f} | "
                     f"loss={np.nanmean([m['training_loss'] for m in recent]):.4f}"
                 )
             if (

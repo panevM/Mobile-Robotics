@@ -84,6 +84,11 @@ class ValidationConfig:
         object.__setattr__(
             self, "diagnostic_seeds", tuple(int(seed) for seed in self.diagnostic_seeds)
         )
+        object.__setattr__(
+            self,
+            "coverage_thresholds",
+            tuple(float(threshold) for threshold in self.coverage_thresholds),
+        )
         if self.frequency <= 0 or self.large_validation_frequency <= 0:
             raise ValueError("validation frequencies must be positive")
         if not 0 < self.checkpoint_seed_count <= len(self.seeds):
@@ -174,11 +179,13 @@ class MiniGridExplorationExperimentConfig:
         reward = checkpoint["reward_config"]
         source_deadlock = checkpoint["deadlock_config"]
         source_coverage = checkpoint.get("coverage_config")
+        modular_config = checkpoint.get("experiment_config", {})
+        validation_data = modular_config.get("validation")
         hyper = checkpoint.get("hyperparameters")
         if hyper is None:
-            modular_config = checkpoint["experiment_config"]
+            if not modular_config:
+                raise ValueError("checkpoint lacks hyperparameters and experiment_config")
             training_data = modular_config["training"]
-            validation_data = modular_config["validation"]
             seed_start = training_data["seed_start"]
             seed_end = seed_start + training_data["seed_count"] - 1
             hyper = {
@@ -211,6 +218,18 @@ class MiniGridExplorationExperimentConfig:
                 ),
                 blocked_penalty=reward["blocked_penalty"],
                 deadlock_penalty=deadlock_penalty,
+                adaptive_frontier_resolution_enabled=reward.get(
+                    "adaptive_frontier_resolution_enabled", False
+                ),
+                frontier_base_reward=reward.get("frontier_base_reward", 0.5),
+                frontier_map_scale=reward.get("frontier_map_scale", 2.0),
+                frontier_known_cell_scale=reward.get(
+                    "frontier_known_cell_scale", 25.0
+                ),
+                frontier_count_exponent=reward.get(
+                    "frontier_count_exponent", 0.75
+                ),
+                frontier_reward_cap=reward.get("frontier_reward_cap", 5.0),
             ),
             coverage=(
                 CoverageRewardConfig(**source_coverage)
@@ -241,10 +260,25 @@ class MiniGridExplorationExperimentConfig:
                 epsilon_end=hyper["epsilon_end"],
                 seed_start=seed_start,
                 seed_count=seed_end - seed_start + 1,
+                random_seed=hyper.get("random_seed", 46),
             ),
-            validation=ValidationConfig(frequency=hyper["validation_frequency"]),
+            validation=(
+                ValidationConfig(**validation_data)
+                if validation_data is not None
+                else ValidationConfig(
+                    frequency=hyper["validation_frequency"],
+                    large_validation_frequency=hyper.get(
+                        "large_validation_frequency", 500
+                    ),
+                    large_validation_episode_count=hyper.get(
+                        "large_validation_episode_count", 100
+                    ),
+                )
+            ),
             output=OutputConfig(output_directory),
-            allowed_actions=tuple(hyper["allowed_actions"]),
+            allowed_actions=tuple(
+                hyper.get("allowed_actions", modular_config.get("allowed_actions", (0, 1, 2)))
+            ),
         )
 
 
